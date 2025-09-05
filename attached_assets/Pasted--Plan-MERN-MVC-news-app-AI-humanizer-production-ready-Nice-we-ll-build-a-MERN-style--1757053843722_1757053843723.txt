@@ -1,0 +1,321 @@
+# Plan: MERN (MVC) news app + AI humanizer (production-ready)
+
+Nice — we’ll build a **MERN-style** app using the MVC pattern where the app fetches articles from news sources, rewrites/humanizes them with an LLM, stores factual metadata, and serves SEO-friendly pages. Important: I **will not** provide tactics to *evade AI-detection systems*. Instead I’ll give you the correct, legal, and SEO-friendly approach to produce content that reads naturally, is high-quality, and ranks in Google. Below is a full plan for your Dev Team: architecture, folder structure, data models, pipeline, LLM integration best practices, SEO checklist, operational concerns, and delivery steps.
+
+---
+
+# 1 — High-level architecture (three-tier)
+
+```
+                    ┌──────────────┐
+                    │  Scheduler   │  (CRON / BullMQ / Agenda)
+                    └────┬─────────┘
+                         │
+            ┌────────────▼────────────┐
+            │  Node.js Backend (MVC)  │  (Express / Nest.js)
+            │  - Fetchers (RSS/NewsAPIs)
+            │  - Extractors
+            │  - LLM Client (Gemini/OpenAI or internal)
+            │  - Controllers / API
+            └────┬─────────┬──────────┘
+                 │         │
+         ┌───────▼──┐  ┌───▼────┐
+         │  DB:     │  │ Cache  │
+         │ MongoDB  │  │ Redis  │
+         └────┬─────┘  └───┬────┘
+              │            │
+     ┌────────▼────────┐   │
+     │ Frontend (Next) │◀──┘  (fetches REST/GraphQL)
+     │ SSR + SSG + CSR  │
+     └─────────────────┘
+```
+
+Deployment: three servers (optional):
+
+1. **LLM server** (if self-hosted models) — GPU/ML infra (or use Gemini API).
+2. **Node backend** — runs fetchers, pipeline, queue workers.
+3. **Frontend** — Next.js (can be Vercel/edge) + CDN.
+
+---
+
+# 2 — Why MERN + MVC is a good fit
+
+* Team familiarity: unified JavaScript/TypeScript stack.
+* Frontend: Next.js gives SSR/SSG which is crucial for SEO.
+* Backend: Node handles I/O heavy tasks (RSS, HTTP fetches, calling LLM API) with async concurrency.
+* MongoDB fits articles with flexible metadata and versions.
+
+---
+
+# 3 — Folder structure (MVC + workers + AI)
+
+```
+/project-root
+├─ backend/
+│  ├─ src/
+│  │  ├─ controllers/        # Express controllers (web/API)
+│  │  ├─ services/           # Business logic (fetchers, summarizer)
+│  │  │   ├─ fetcher.newsapi.ts
+│  │  │   ├─ fetcher.rss.ts
+│  │  │   ├─ extractor.trafilatura.ts (or node alternative)
+│  │  │   └─ llm.client.ts   # Gemini / OpenAI wrapper
+│  │  ├─ models/             # Mongoose schemas
+│  │  ├─ workers/            # queue workers (BullMQ)
+│  │  ├─ jobs/               # scheduled jobs
+│  │  ├─ routes/
+│  │  ├─ utils/
+│  │  └─ app.ts              # express app
+│  ├─ Dockerfile
+│  └─ package.json
+├─ llm-server/ (optional)
+│  ├─ inference/             # vLLM, Ollama, etc.
+│  └─ docker-compose
+├─ frontend/ (next.js)
+│  ├─ app/                   # pages + server components
+│  ├─ components/
+│  ├─ styles/
+│  └─ package.json
+├─ infra/
+│  ├─ docker-compose.yml
+│  ├─ nginx/
+│  └─ terraform/ (optional)
+└─ README.md
+```
+
+---
+
+# 4 — Data model (Mongoose schemas)
+
+Article:
+
+```js
+Article {
+  _id,
+  url: String (unique),
+  title: String,
+  source: { name, domain },
+  publishedAt: Date,
+  fetchedAt: Date,
+  rawText: String (optional, could be compressed or kept only short-term),
+  authors: [String],
+  language: String,
+  tags: [String],
+  license: { text, url },
+  status: Enum('fetched','extracted','humanized','published'),
+  redirects: [String],
+}
+```
+
+Report (rewritten):
+
+```js
+Report {
+  _id,
+  articleId: ObjectId,
+  tldr: String,
+  bullets: [String],
+  humanizedHtml: String,   // sanitized HTML for UI
+  humanizedPlain: String,
+  entities: {orgs:[], persons:[], places:[]},
+  checks: { factChecks: [], quotedTexts: [] },
+  createdAt, updatedAt
+}
+```
+
+Also store `Source` collection for metadata and rate-limiting.
+
+---
+
+# 5 — Pipeline: fetch → extract → humanize → store → publish
+
+1. **Fetch phase (worker)**
+
+   * Poll News APIs or RSS feeds per topic.
+   * Save minimal metadata (title, url, source, publishedAt) and mark `status='fetched'`.
+   * Use `If-Modified-Since` / ETag to reduce bandwidth where supported.
+
+2. **Extract phase**
+
+   * Fetch full HTML (httpx/node-fetch) with polite headers and timeouts.
+   * Pass HTML to robust extractor: `trafilatura` (Python) or `readability`/`mercury-parser` (Node). Consider a small Python microservice if using trafilatura.
+   * Save `rawText` compressed (optional), `status='extracted'`.
+
+3. **Humanize (LLM)**
+
+   * Send up-to-12k chars (or split long articles) to LLM API with **strict, factual prompt** (see below).
+   * Receive TL;DR, bullets, context, and humanized copy.
+   * Run **factuality checks**: compare numbers/dates using simple regex extractors; flag mismatches.
+   * Sanitize & store `humanizedHtml`, create snippet for SEO (meta description).
+
+4. **Publish**
+
+   * Mark `status='published'`.
+   * Frontend builds SSG pages for top stories; dynamic pages for others (ISR/SSR).
+   * Emit webhook or push to cache/CDN (invalidate) for updated pages.
+
+5. **Housekeeping**
+
+   * Purge raw text after configurable retention (e.g., 7 days). Keep `humanized` content permanently (or per policy).
+   * Rate-limit retries, backoff, domain-level throttling.
+
+---
+
+# 6 — LLM integration & prompt strategy (safe + high-quality)
+
+Use an LLM to rewrite, but avoid hallucination and heavy paraphrasing of copyrighted text. Recommended approach:
+
+* **Provider**: Google Gemini (API) or OpenAI (if allowed). If cost is concern, self-host a model on your LLM server.
+* **Prompt guardrails** (do NOT use to evade detection):
+
+  * System: “You are a precise, neutral news editor. Only use the provided article text. Do not invent facts. If a fact is missing, say ‘Not stated in article.’ Preserve quoted text and attribute. Output: TL;DR (2 lines), Bullets (4–8 factual points), Humanized article (150–400 words), Sources: original URL.”
+* **Post-LLM checks**:
+
+  * Named-entity extraction (spaCy) to verify dates/numbers appear in raw text. If not found, flag for manual review.
+  * Score readability (Flesch-Kincaid).
+  * Run plagiarism & similarity checks (e.g., Against original -> ensure rewritten text differs sufficiently but preserves facts).
+* **Human-in-the-loop**:
+
+  * For high-value or sensitive articles, route to an editor dashboard for quick edits and approval.
+
+**Important**: I will not provide instructions to evade AI detectors. Instead aim to produce *high-quality editorial content* with human review and original commentary — that’s the correct, Google-friendly path.
+
+---
+
+# 7 — SEO & Google ranking checklist (must-haves)
+
+These make content rank and *naturally* look human:
+
+1. **Original value**: add analysis, context, or aggregation. Don’t publish near-verbatim rewrites.
+2. **Structured data**: add `schema.org/NewsArticle` JSON-LD (headline, datePublished, author, mainEntityOfPage, publisher, image).
+3. **Canonical & hreflang**: avoid duplicate content penalties.
+4. **Title tags & meta descriptions**: unique, keyword-focused, 50–70 chars (title), 150–160 chars (meta).
+5. **Mobile-first & Core Web Vitals**: fast CLS, LCP, FID. Use image optimization + CDN.
+6. **Sitemap & robots.txt**: register sitemap in Google Search Console.
+7. **Internal linking & tag pages**: group related articles; create topical hubs.
+8. **Author pages & bylines**: builds authority (E-A-T).
+9. **Backlinks & distribution**: syndicate to social, newsletters, reach out to sites for backlinks.
+10. **Avoid scraping disallowed content**: respect robots, copyright. If quoting, quote small excerpts and attribute.
+11. **Sitemaps for structured updates** (news sitemap if frequent updates) or use PubSubHubbub for real-time indexing.
+
+---
+
+# 8 — Legal & ethical guardrails
+
+* Always **cite the source URL** and display publisher name.
+* Limit verbatim quotes and include clear attribution.
+* Respect `robots.txt` and rate limits; cache responsibly.
+* For copyrighted or paywalled content: don’t republish full text; extract snippets + add original reporting/analysis.
+
+---
+
+# 9 — Operations & scaling
+
+* **Queue**: BullMQ (Redis) for workers, retries, and domain-level throttling.
+* **Cache**: Redis for hot articles and API responses.
+* **DB**: MongoDB (Atlas) with TTL for raw text (short-term).
+* **Monitoring**: Prometheus/Grafana + Sentry for errors.
+* **CI/CD**: GitHub Actions or GitLab pipelines — deploy backend/docker image, frontend to Vercel or Node host, infra with Terraform.
+* **Secrets**: Use Vault or cloud secret manager for Gemini/OpenAI keys.
+
+---
+
+# 10 — Metrics & analytics
+
+* Daily articles fetched, humanized, published.
+* LLM cost per article & percent of human-reviewed.
+* Pages indexed by Google, organic traffic, bounce, CTR.
+* Average time-to-publish.
+* Fact-check error rate (auto-detected mismatches).
+
+---
+
+# 11 — Sample API endpoints (backend)
+
+* `POST /admin/refresh` — trigger refresh (protected)
+* `GET  /api/reports?topic=ai&limit=20` — public feed
+* `GET  /article/:slug` — article page (SEO meta on server)
+* `GET  /admin/review/pending` — editors’ queue
+* `POST /admin/approve/:reportId` — approve for publish
+
+---
+
+# 12 — Tickets & Dev-team roadmap (sprint-ready)
+
+**Sprint 1 (MVP — 2 weeks)**
+
+* Setup repo, infra, and Docker skeleton.
+* Build Article & Report Mongoose schemas.
+* Implement RSS fetcher + feedparser; persist metadata.
+* Implement HTML fetch + extractor (Node library or small Python microservice).
+* Build a simple Gemini/OpenAI client wrapper (config-driven).
+* Implement humanize worker + store report.
+* API: `/reports` and minimal Next.js frontend fetch.
+
+**Sprint 2 (hardening — 2 weeks)**
+
+* Add dedupe & domain throttling.
+* Add Redis + BullMQ with retry/backoff.
+* Add TTL purge for raw text.
+* Add simple entity extraction & factual-check comparator.
+* Add editor UI to approve/reject.
+
+**Sprint 3 (SEO & scaling — 2 weeks)**
+
+* Add Next.js SSR/SSG for top articles.
+* Add JSON-LD schema & sitemap generator.
+* Integrate Google Search Console, core web vitals checks.
+* Add analytics & monitoring.
+
+**Ongoing**
+
+* Add personalization, clustering, push notifications.
+* Consider a self-hosted LLM server if costs grow.
+
+---
+
+# 13 — Best practices to make AI-humanized content *natural* (and Google-friendly)
+
+* Use LLMs to **rewrite + add unique context**, not to merely paraphrase.
+* Add editorial lines: “Why this matters”, “What to watch next”: human insight improves ranking.
+* Keep copies **shorter or differently structured** than the original; add bullets, timelines, or sideboxes.
+* Add author byline, timestamp, and source link. Google prefers clear provenance and E-A-T.
+* Always run a similarity check to ensure you’re not producing near-verbatim text.
+
+**I will not give instructions to hide AI provenance or to defeat AI detectors.** That is risky legally and ethically. The right path is to produce genuinely original editorial content, and to have proper attribution and editor oversight.
+
+---
+
+# 14 — Example LLM system prompt (safe/factual)
+
+> System: “You are an objective news editor. Use only the provided article text. Do not invent facts. If some fact (date/number/name) is not present in the text, say ‘Not stated.’ Output a JSON object with fields: `tldr` (two-sentence), `bullets` (4–8 factual bullet strings), `humanized` (a 150–400-word human-style article that adds context and interpretation without inventing facts), `sources` (list of original URLs). Keep tone neutral and journalistic.”
+
+Use low temperature (0.2–0.4), max tokens constrained. Then run entity/exact-match checks.
+
+---
+
+# 15 — Quick checklist to hand your dev team
+
+* [ ] Repo & branch strategy (main/dev/feature).
+* [ ] Infra: Redis, MongoDB, CI/CD, secret manager.
+* [ ] Implement fetchers (RSS + NewsAPI adapters).
+* [ ] Implement extractor (choose Node or Python microservice).
+* [ ] LLM client (Gemini/OpenAI) + prompt library.
+* [ ] Worker queue (BullMQ) + rate-limits per domain.
+* [ ] Editor UI & approval workflow.
+* [ ] Next.js SEO pages + JSON-LD + sitemap.
+* [ ] Analytics + error logging + SLAs.
+
+---
+
+# Final notes & decision points for you to confirm with the team
+
+1. Will you use **Gemini** (Google) or **OpenAI** (or self-hosted)? (impacts SDKs and infra)
+2. Do you want a **Python microservice** for trafilatura (best extractor) or pure Node solution? (tradeoffs: quality vs single-language stack)
+3. Which DB for long-term scaling: MongoDB Atlas or Postgres?
+4. Editor involvement level: automatic publish vs human review threshold?
+
+Tell me which decisions you want to lock in and I’ll generate: (a) the Express + Mongoose skeleton with fetcher + worker, or (b) the Next.js SEO page template and JSON-LD snippets, or (c) the exact LLM prompt + prompt wrapper code for Gemini.
+
+
+we will use Gemini API and single-language Node solution for extraction, with mongoDB atlas as the database and human review threshold for editor involvement.
+
